@@ -5718,6 +5718,9 @@ static int ena_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 #ifdef ENA_HAVE_NETDEV_XDP_FEATURES
 	netdev->xdp_features = ENA_XDP_FEATURES;
+#ifdef ENA_XSK_MB_SUPPORT
+	netdev->xdp_zc_max_segs = ENA_PKT_MAX_BUFS;
+#endif /* ENA_XSK_MB_SUPPORT */
 
 #endif
 	memcpy(adapter->netdev->perm_addr, adapter->mac_addr, netdev->addr_len);

@@ -718,7 +718,12 @@ static bool ena_xdp_clean_tx_zc(struct ena_ring *tx_ring, u32 budget)
 		is_zc_pkt = !(skb || xdpf);
 
 		cleaned_pkts++;
+#ifdef ENA_XSK_MB_SUPPORT
+		if (is_zc_pkt)
+			zc_pkts += tx_info->xsk_tx_nr_descs;
+#else
 		zc_pkts += is_zc_pkt;
+#endif /* ENA_XSK_MB_SUPPORT */
 		total_done += tx_info->tx_descs;
 
 		if (xdpf) {
@@ -812,18 +817,42 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 			size -= push_len;
 		}
 
+		ena_buf = tx_info->bufs;
+		tx_info->num_of_bufs = 0;
+
 		if (size) {
-			/* Pass the rest of the descriptor as a DMA address. Assuming
-			 * single page descriptor.
-			 */
+			/* Pass the rest of the descriptor as a DMA address */
 			dma  = xsk_buff_raw_get_dma(xsk_pool, desc.addr);
-			ena_buf = tx_info->bufs;
 			ena_buf->paddr = dma + push_len;
 			ena_buf->len = size;
-
-			ena_tx_ctx.ena_bufs = ena_buf;
-			ena_tx_ctx.num_bufs = 1;
+			ena_buf++;
+			tx_info->num_of_bufs = 1;
 		}
+
+#ifdef ENA_XSK_MB_SUPPORT
+		/* Gather continuation descriptors for multi-buffer SG */
+		tx_info->xsk_tx_nr_descs = 1;
+		while (!xsk_is_eop_desc(&desc)) {
+			struct xdp_desc frag_desc;
+
+			if (!xsk_tx_peek_desc(xsk_pool, &frag_desc))
+				break;
+			if (tx_info->num_of_bufs >= tx_ring->sgl_size)
+				break;
+
+			ena_buf->paddr = xsk_buff_raw_get_dma(xsk_pool,
+							      frag_desc.addr);
+			ena_buf->len = frag_desc.len;
+			ena_buf++;
+			tx_info->num_of_bufs++;
+			size += frag_desc.len;
+			tx_info->xsk_tx_nr_descs++;
+			desc = frag_desc;
+		}
+#endif /* ENA_XSK_MB_SUPPORT */
+
+		ena_tx_ctx.ena_bufs = tx_info->bufs;
+		ena_tx_ctx.num_bufs = tx_info->num_of_bufs;
 
 #ifdef ENA_HAVE_XSK_TX_METADATA
 		if (unlikely(is_tx_metadata_enabled)) {
@@ -849,12 +878,12 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 				     tx_info,
 				     &ena_tx_ctx,
 				     next_to_use,
-				     desc.len);
+				     size + push_len);
 		if (rc)
 			break;
 
 		total_pkts++;
-		total_bytes += desc.len;
+		total_bytes += size + push_len;
 
 		work_done++;
 	}
@@ -880,12 +909,11 @@ static struct sk_buff *ena_xdp_rx_skb_zc(struct ena_ring *rx_ring, struct xdp_bu
 	struct sk_buff *skb;
 	void *data_addr;
 
-	/* Assuming single-page packets for XDP */
 	headroom  = xdp->data - xdp->data_hard_start;
 	data_len  = xdp->data_end - xdp->data;
 	data_addr = xdp->data;
 
-	/* allocate a skb to store the frags */
+	/* allocate a skb to store the data */
 	skb = napi_alloc_skb(rx_ring->napi,
 			     headroom + data_len);
 	if (unlikely(!skb)) {
@@ -898,6 +926,22 @@ static struct sk_buff *ena_xdp_rx_skb_zc(struct ena_ring *rx_ring, struct xdp_bu
 
 	skb_reserve(skb, headroom);
 	memcpy(__skb_put(skb, data_len), data_addr, data_len);
+
+#ifdef ENA_XSK_MB_SUPPORT
+	/* Copy frag data for multi-buffer packets (XDP_PASS path) */
+	if (xdp_buff_has_frags(xdp)) {
+		struct skb_shared_info *sinfo = xdp_get_shared_info_from_buff(xdp);
+		int i;
+
+		for (i = 0; i < sinfo->nr_frags; i++) {
+			skb_frag_t *frag = &sinfo->frags[i];
+			u32 frag_len = skb_frag_size(frag);
+			void *frag_addr = skb_frag_address(frag);
+
+			memcpy(__skb_put(skb, frag_len), frag_addr, frag_len);
+		}
+	}
+#endif /* ENA_XSK_MB_SUPPORT */
 
 	return skb;
 }
@@ -959,17 +1003,65 @@ static bool ena_xdp_clean_rx_irq_zc(struct ena_ring *rx_ring,
 
 		/* XDP multi-buffer packets not supported */
 		if (unlikely(ena_rx_ctx.descs > 1)) {
+#ifdef ENA_XSK_MB_SUPPORT
+			struct skb_shared_info *sinfo;
+
+			if (unlikely(ena_rx_ctx.descs - 1 > MAX_SKB_FRAGS)) {
+				netdev_err_once(rx_ring->netdev,
+						"xdp: too many frags (%d)\n",
+						ena_rx_ctx.descs);
+				ena_increase_stat(&rx_ring->rx_stats.xdp_drop, 1,
+						  &rx_ring->syncp);
+				xdp_verdict = ENA_XDP_RECYCLE;
+				goto consume_descs;
+			}
+
+			xdp_buff_set_frags_flag(xdp);
+			sinfo = xdp_get_shared_info_from_buff(xdp);
+			sinfo->nr_frags = 0;
+			sinfo->xdp_frags_size = 0;
+
+			for (i = 1; i < ena_rx_ctx.descs; i++) {
+				struct ena_rx_buffer *frag_info;
+				struct xdp_buff *frag_xdp;
+				u32 frag_len;
+
+				frag_info = &rx_ring->rx_buffer_info[
+					ena_rx_ctx.ena_bufs[i].req_id];
+				frag_xdp = frag_info->xdp;
+				frag_len = ena_rx_ctx.ena_bufs[i].len;
+
+				xsk_buff_set_size(frag_xdp, frag_len);
+				xsk_buff_dma_sync_for_cpu(frag_xdp,
+							  rx_ring->xsk_pool);
+
+				__skb_fill_page_desc_noacc(sinfo,
+							   sinfo->nr_frags,
+							   virt_to_page(frag_xdp->data_hard_start),
+							   XDP_PACKET_HEADROOM,
+							   frag_len);
+				sinfo->nr_frags++;
+				sinfo->xdp_frags_size += frag_len;
+				xsk_buff_add_frag(frag_xdp);
+			}
+#else
 			netdev_err_once(rx_ring->netdev,
 					"xdp: dropped unsupported multi-buffer packets\n");
 			ena_increase_stat(&rx_ring->rx_stats.xdp_drop, 1, &rx_ring->syncp);
 			xdp_verdict = ENA_XDP_RECYCLE;
-		} else if (likely(!!xdp_prog)) {
+#endif /* ENA_XSK_MB_SUPPORT */
+		}
+
+		if (likely(xdp_verdict == ENA_XDP_PASS) && likely(!!xdp_prog)) {
 #ifdef ENA_HAVE_XDP_HINTS_DEPS
 			ena_xdp_buff_fill(xdp, &ena_rx_ctx);
 #endif /* ENA_HAVE_XDP_HINTS_DEPS */
 			xdp_verdict = ena_xdp_execute(rx_ring, xdp, xdp_prog);
 		}
 
+#ifdef ENA_XSK_MB_SUPPORT
+consume_descs:
+#endif /* ENA_XSK_MB_SUPPORT */
 		/* Note that there can be several descriptors, since device
 		 * might not honor MTU
 		 */
@@ -988,9 +1080,22 @@ static bool ena_xdp_clean_rx_irq_zc(struct ena_ring *rx_ring,
 			total_len += xdp_len;
 			xdp_flags |= xdp_verdict;
 
-			/* Mark buffer as consumed when it is redirected or freed */
-			if (likely(xdp_verdict & (ENA_XDP_FORWARDED | ENA_XDP_DROP)))
+			/* Mark buffer as consumed when it is redirected or freed.
+			 * For multi-buffer, NULL all frag pointers too since
+			 * the XDP framework owns them via xsk_buff_add_frag.
+			 */
+			if (likely(xdp_verdict & (ENA_XDP_FORWARDED | ENA_XDP_DROP))) {
 				rx_info->xdp = NULL;
+#ifdef ENA_XSK_MB_SUPPORT
+				for (i = 1; i < ena_rx_ctx.descs; i++) {
+					struct ena_rx_buffer *frag_info;
+
+					frag_info = &rx_ring->rx_buffer_info[
+						ena_rx_ctx.ena_bufs[i].req_id];
+					frag_info->xdp = NULL;
+				}
+#endif /* ENA_XSK_MB_SUPPORT */
+			}
 
 			continue;
 		}
