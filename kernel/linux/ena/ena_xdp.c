@@ -761,6 +761,177 @@ static bool ena_xdp_clean_tx_zc(struct ena_ring *tx_ring, u32 budget)
 	return acked_pkts < budget;
 }
 
+#ifdef ENA_XSK_MB_SUPPORT
+/* Multi-buffer (kernel >= 6.6) zero-copy Tx fast path.
+ *
+ * xsk_tx_peek_release_desc_batch() consumes whole frames atomically: it never
+ * exposes a partial multi-buffer frame and reserves a completion-queue slot for
+ * every descriptor it returns. That gives us three properties the legacy
+ * per-descriptor peek loop cannot:
+ *   - a frame is never truncated on the wire,
+ *   - the descriptor stream never desyncs (we never consume a non-EOP prefix),
+ *   - per-descriptor completions stay correctly ordered against in-flight
+ *     frames (completing dropped descriptors out-of-band via xsk_tx_completed()
+ *     would race the ordered cq and free in-flight UMEM addresses early).
+ *
+ * The batch is non-revocable (the descriptors are consumed and their cq slots
+ * reserved before we see them), so the whole returned batch must be submittable
+ * to the SQ. A frame uses at most (num_bufs + 2) SQ entries - the same bound the
+ * stack path reserves per packet - which is at most 3 entries per descriptor in
+ * the worst case of all single-descriptor frames. We therefore request at most
+ * sq_free / 3 descriptors so the result is guaranteed to fit.
+ *
+ * The function also releases the Tx ring internally, so the caller must not
+ * call xsk_tx_release(). It returns the number of frames submitted, and may
+ * return 0 when the batch peek is not usable (e.g. several sockets share the
+ * pool); the caller then falls back to the per-descriptor path.
+ */
+static int ena_xdp_xmit_zc_batch(struct ena_ring *tx_ring,
+				 struct xsk_buff_pool *xsk_pool, int budget,
+				 u64 *total_pkts, u64 *total_bytes)
+{
+	struct xdp_desc *descs = xsk_pool->tx_descs;
+	int work_done = 0;
+	int rc = 0;
+#ifdef ENA_HAVE_XSK_TX_METADATA
+	bool is_tx_metadata_enabled = xp_tx_metadata_enabled(xsk_pool);
+#endif /* ENA_HAVE_XSK_TX_METADATA */
+
+	while (likely(work_done < budget)) {
+		u32 sq_free = ena_com_free_q_entries(tx_ring->ena_com_io_sq);
+		u32 nb_descs, idx;
+
+		nb_descs = min_t(u32, budget - work_done, sq_free / 3);
+		if (unlikely(!nb_descs))
+			break;
+
+		nb_descs = xsk_tx_peek_release_desc_batch(xsk_pool, nb_descs);
+		if (!nb_descs)
+			break;
+
+		for (idx = 0; idx < nb_descs;) {
+			struct ena_com_tx_ctx ena_tx_ctx = {};
+			struct xdp_desc *first = &descs[idx];
+			struct ena_tx_buffer *tx_info;
+			struct ena_com_buf *ena_buf;
+			u32 frame_descs = 1;
+			int push_len = 0;
+			u16 next_to_use, req_id;
+			int size;
+
+			next_to_use = tx_ring->next_to_use;
+			req_id = tx_ring->free_ids[next_to_use];
+			tx_info = &tx_ring->tx_buffer_info[req_id];
+
+			size = first->len;
+
+			if (likely(tx_ring->tx_mem_queue_type ==
+				   ENA_ADMIN_PLACEMENT_POLICY_DEV)) {
+				/* Designate part of the packet for LLQ */
+				push_len = min_t(u32, size,
+						 tx_ring->tx_max_header_size);
+				ena_tx_ctx.push_header =
+					xsk_buff_raw_get_data(xsk_pool,
+							      first->addr);
+				ena_tx_ctx.header_len = push_len;
+				size -= push_len;
+			}
+
+			ena_buf = tx_info->bufs;
+			tx_info->num_of_bufs = 0;
+
+			if (size) {
+				dma_addr_t dma =
+					xsk_buff_raw_get_dma(xsk_pool,
+							     first->addr);
+
+				ena_buf->paddr = dma + push_len;
+				ena_buf->len = size;
+				ena_buf++;
+				tx_info->num_of_bufs = 1;
+			}
+
+			/* Gather this frame's continuation descriptors. The
+			 * batch guarantees a complete frame, so the EOP is
+			 * within [idx, nb_descs).
+			 */
+			while (!xsk_is_eop_desc(&descs[idx + frame_descs - 1]) &&
+			       idx + frame_descs < nb_descs) {
+				struct xdp_desc *frag = &descs[idx + frame_descs];
+
+				/* Bounded by the SGL. With xdp_zc_max_segs
+				 * clamped to the SGL this only fires for a
+				 * non-conformant frame larger than advertised:
+				 * drop the excess fragment bytes but keep
+				 * counting descriptors so the completion
+				 * accounting and stream framing stay correct.
+				 */
+				if (likely(tx_info->num_of_bufs <
+					   tx_ring->sgl_size)) {
+					ena_buf->paddr =
+						xsk_buff_raw_get_dma(xsk_pool,
+								     frag->addr);
+					ena_buf->len = frag->len;
+					ena_buf++;
+					tx_info->num_of_bufs++;
+					size += frag->len;
+				}
+
+				frame_descs++;
+			}
+
+			/* The batch peek must only hand back complete frames. If
+			 * the EOP is missing the kernel violated that contract;
+			 * warn so it is caught in testing instead of silently
+			 * desyncing the stream.
+			 */
+			if (unlikely(!xsk_is_eop_desc(&descs[idx + frame_descs - 1])))
+				netdev_err_once(tx_ring->netdev,
+						"xsk tx: batch returned a partial frame\n");
+
+			tx_info->xsk_tx_nr_descs = frame_descs;
+			ena_tx_ctx.ena_bufs = tx_info->bufs;
+			ena_tx_ctx.num_bufs = tx_info->num_of_bufs;
+
+#ifdef ENA_HAVE_XSK_TX_METADATA
+			if (unlikely(is_tx_metadata_enabled)) {
+				struct xsk_tx_metadata *meta =
+					xsk_buff_get_metadata(xsk_pool,
+							      first->addr);
+
+				/* Save a pointer to completion metadata to fill
+				 * it later upon completion
+				 */
+				xsk_tx_metadata_to_compl(meta,
+							 &tx_info->xsk_meta_compl);
+			}
+#endif /* ENA_HAVE_XSK_TX_METADATA */
+
+			ena_tx_ctx.req_id = req_id;
+
+			rc = ena_xmit_common(tx_ring->adapter, tx_ring, tx_info,
+					     &ena_tx_ctx, next_to_use,
+					     size + push_len);
+			if (unlikely(rc))
+				break;
+
+			(*total_pkts)++;
+			*total_bytes += size + push_len;
+			work_done++;
+			idx += frame_descs;
+		}
+
+		/* SQ sizing guarantees space, so any error here is fatal and
+		 * ena_xmit_common() already scheduled a device reset.
+		 */
+		if (unlikely(rc))
+			break;
+	}
+
+	return work_done;
+}
+#endif /* ENA_XSK_MB_SUPPORT */
+
 static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 				struct napi_struct *napi,
 				int budget)
@@ -769,6 +940,7 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 	int size, rc, push_len = 0, work_done = 0;
 	struct ena_tx_buffer *tx_info;
 	struct ena_com_buf *ena_buf;
+	bool tx_ring_released = false;
 	u64 total_pkts, total_bytes;
 #ifdef ENA_HAVE_XSK_TX_METADATA
 	bool is_tx_metadata_enabled;
@@ -789,103 +961,129 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 	/* Avoid TX time out as we are sharing the queues */
 	txq_trans_cond_update(txq);
 
-	while (likely(work_done < budget)) {
-		struct ena_com_tx_ctx ena_tx_ctx = {};
+#ifdef ENA_XSK_MB_SUPPORT
+	/* Fast path: frame-atomic batch peek (releases the Tx ring itself). */
+	work_done = ena_xdp_xmit_zc_batch(tx_ring, xsk_pool, budget,
+					  &total_pkts, &total_bytes);
+	tx_ring_released = work_done > 0;
 
-		/* To align with the network stack path (.ndo_start_xmit) we
-		 * leave the same amount of empty space in the SQ.
-		 */
-		if (unlikely(!ena_com_sq_have_enough_space(
-			    tx_ring->ena_com_io_sq, tx_ring->sgl_size + 2)))
-			break;
+	/* Fall back to the per-descriptor path when the batch peek did nothing.
+	 * That covers both an empty ring (cheap no-op below) and the
+	 * multi-socket-shared-pool case the batch peek does not handle, so Tx
+	 * does not stall there.
+	 */
+	if (!work_done)
+#endif /* ENA_XSK_MB_SUPPORT */
+	{
+		while (likely(work_done < budget)) {
+			struct ena_com_tx_ctx ena_tx_ctx = {};
 
-		if (!xsk_tx_peek_desc(xsk_pool, &desc))
-			break;
+			/* To align with the network stack path (.ndo_start_xmit)
+			 * we leave the same amount of empty space in the SQ.
+			 */
+			if (unlikely(!ena_com_sq_have_enough_space(
+				    tx_ring->ena_com_io_sq,
+				    tx_ring->sgl_size + 2)))
+				break;
 
-		next_to_use = tx_ring->next_to_use;
-		req_id = tx_ring->free_ids[next_to_use];
-		tx_info = &tx_ring->tx_buffer_info[req_id];
+			if (!xsk_tx_peek_desc(xsk_pool, &desc))
+				break;
 
-		size = desc.len;
+			next_to_use = tx_ring->next_to_use;
+			req_id = tx_ring->free_ids[next_to_use];
+			tx_info = &tx_ring->tx_buffer_info[req_id];
 
-		if (likely(tx_ring->tx_mem_queue_type == ENA_ADMIN_PLACEMENT_POLICY_DEV)) {
-			/* Designate part of the packet for LLQ */
-			push_len = min_t(u32, size, tx_ring->tx_max_header_size);
-			ena_tx_ctx.push_header = xsk_buff_raw_get_data(xsk_pool, desc.addr);
-			ena_tx_ctx.header_len = push_len;
+			size = desc.len;
 
-			size -= push_len;
-		}
+			if (likely(tx_ring->tx_mem_queue_type == ENA_ADMIN_PLACEMENT_POLICY_DEV)) {
+				/* Designate part of the packet for LLQ */
+				push_len = min_t(u32, size, tx_ring->tx_max_header_size);
+				ena_tx_ctx.push_header = xsk_buff_raw_get_data(xsk_pool, desc.addr);
+				ena_tx_ctx.header_len = push_len;
 
-		ena_buf = tx_info->bufs;
-		tx_info->num_of_bufs = 0;
+				size -= push_len;
+			}
 
-		if (size) {
-			/* Pass the rest of the descriptor as a DMA address */
-			dma  = xsk_buff_raw_get_dma(xsk_pool, desc.addr);
-			ena_buf->paddr = dma + push_len;
-			ena_buf->len = size;
-			ena_buf++;
-			tx_info->num_of_bufs = 1;
-		}
+			ena_buf = tx_info->bufs;
+			tx_info->num_of_bufs = 0;
+
+			if (size) {
+				/* Pass the rest of the descriptor as a DMA address */
+				dma  = xsk_buff_raw_get_dma(xsk_pool, desc.addr);
+				ena_buf->paddr = dma + push_len;
+				ena_buf->len = size;
+				ena_buf++;
+				tx_info->num_of_bufs = 1;
+			}
 
 #ifdef ENA_XSK_MB_SUPPORT
-		/* Gather continuation descriptors for multi-buffer SG */
-		tx_info->xsk_tx_nr_descs = 1;
-		while (!xsk_is_eop_desc(&desc)) {
-			struct xdp_desc frag_desc;
+			/* Gather continuation descriptors for multi-buffer SG.
+			 * Only reached on the fallback (multi-socket) path; the
+			 * batch fast path keeps framing without this. A break
+			 * here before EOP (SGL bound or Tx-ring backpressure)
+			 * truncates the frame and can desync the stream - the
+			 * residual the batch path was added to avoid - but it is
+			 * confined to the uncommon shared-pool case.
+			 */
+			tx_info->xsk_tx_nr_descs = 1;
+			while (!xsk_is_eop_desc(&desc)) {
+				struct xdp_desc frag_desc;
 
-			if (!xsk_tx_peek_desc(xsk_pool, &frag_desc))
-				break;
-			if (tx_info->num_of_bufs >= tx_ring->sgl_size)
-				break;
+				if (!xsk_tx_peek_desc(xsk_pool, &frag_desc))
+					break;
+				if (tx_info->num_of_bufs >= tx_ring->sgl_size)
+					break;
 
-			ena_buf->paddr = xsk_buff_raw_get_dma(xsk_pool,
-							      frag_desc.addr);
-			ena_buf->len = frag_desc.len;
-			ena_buf++;
-			tx_info->num_of_bufs++;
-			size += frag_desc.len;
-			tx_info->xsk_tx_nr_descs++;
-			desc = frag_desc;
-		}
+				ena_buf->paddr = xsk_buff_raw_get_dma(xsk_pool,
+								      frag_desc.addr);
+				ena_buf->len = frag_desc.len;
+				ena_buf++;
+				tx_info->num_of_bufs++;
+				size += frag_desc.len;
+				tx_info->xsk_tx_nr_descs++;
+				desc = frag_desc;
+			}
 #endif /* ENA_XSK_MB_SUPPORT */
 
-		ena_tx_ctx.ena_bufs = tx_info->bufs;
-		ena_tx_ctx.num_bufs = tx_info->num_of_bufs;
+			ena_tx_ctx.ena_bufs = tx_info->bufs;
+			ena_tx_ctx.num_bufs = tx_info->num_of_bufs;
 
 #ifdef ENA_HAVE_XSK_TX_METADATA
-		if (unlikely(is_tx_metadata_enabled)) {
-			struct xsk_tx_metadata *meta =
-				xsk_buff_get_metadata(xsk_pool, desc.addr);
+			if (unlikely(is_tx_metadata_enabled)) {
+				struct xsk_tx_metadata *meta =
+					xsk_buff_get_metadata(xsk_pool, desc.addr);
 
-			/* Save a pointer to completion metadata to fill it
-			 * later upon completion
-			 */
-			xsk_tx_metadata_to_compl(meta,
-						 &tx_info->xsk_meta_compl);
-		}
+				/* Save a pointer to completion metadata to fill
+				 * it later upon completion
+				 */
+				xsk_tx_metadata_to_compl(meta,
+							 &tx_info->xsk_meta_compl);
+			}
 #endif /* ENA_HAVE_XSK_TX_METADATA */
 
-		ena_tx_ctx.req_id = req_id;
+			ena_tx_ctx.req_id = req_id;
 
-		netif_dbg(tx_ring->adapter, tx_queued, tx_ring->netdev,
-			  "Queueing zc packet on q %d, %s DMA part (req-id %d)\n",
-			  tx_ring->qid, ena_tx_ctx.num_bufs ? "with" : "without", req_id);
+			netif_dbg(tx_ring->adapter, tx_queued, tx_ring->netdev,
+				  "Queueing zc packet on q %d, %s DMA part (req-id %d)\n",
+				  tx_ring->qid, ena_tx_ctx.num_bufs ? "with" : "without", req_id);
 
-		rc = ena_xmit_common(tx_ring->adapter,
-				     tx_ring,
-				     tx_info,
-				     &ena_tx_ctx,
-				     next_to_use,
-				     size + push_len);
-		if (rc)
-			break;
+			rc = ena_xmit_common(tx_ring->adapter,
+					     tx_ring,
+					     tx_info,
+					     &ena_tx_ctx,
+					     next_to_use,
+					     size + push_len);
+			if (rc)
+				break;
 
-		total_pkts++;
-		total_bytes += size + push_len;
+			total_pkts++;
+			total_bytes += size + push_len;
 
-		work_done++;
+			work_done++;
+		}
+
+		if (work_done && !tx_ring_released)
+			xsk_tx_release(xsk_pool);
 	}
 
 	if (work_done) {
@@ -894,7 +1092,6 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 		tx_ring->tx_stats.xsk_bytes += total_bytes;
 		u64_stats_update_end(&tx_ring->syncp);
 
-		xsk_tx_release(xsk_pool);
 		ena_ring_tx_doorbell(tx_ring);
 	}
 
@@ -945,6 +1142,26 @@ static struct sk_buff *ena_xdp_rx_skb_zc(struct ena_ring *rx_ring, struct xdp_bu
 
 	return skb;
 }
+
+#ifdef ENA_XSK_MB_SUPPORT
+/* Drop the driver's references to a multi-buffer packet's fragment buffers
+ * (the head is handled by the caller). This must be done whenever the
+ * buffers have been freed or handed to the XDP framework, so that neither
+ * ring teardown (ena_xdp_free_rx_bufs_zc) nor refill (ena_alloc_rx_buffer)
+ * touches a buffer the driver no longer owns.
+ */
+static void ena_xdp_zc_unref_frags(struct ena_ring *rx_ring,
+				   struct ena_com_rx_ctx *ena_rx_ctx)
+{
+	int i;
+
+	for (i = 1; i < ena_rx_ctx->descs; i++) {
+		u16 req_id = ena_rx_ctx->ena_bufs[i].req_id;
+
+		rx_ring->rx_buffer_info[req_id].xdp = NULL;
+	}
+}
+#endif /* ENA_XSK_MB_SUPPORT */
 
 static bool ena_xdp_clean_rx_irq_zc(struct ena_ring *rx_ring,
 				    struct napi_struct *napi, int budget)
@@ -1080,20 +1297,28 @@ consume_descs:
 			total_len += xdp_len;
 			xdp_flags |= xdp_verdict;
 
-			/* Mark buffer as consumed when it is redirected or freed.
-			 * For multi-buffer, NULL all frag pointers too since
-			 * the XDP framework owns them via xsk_buff_add_frag.
+			/* FORWARDED: the XDP framework now owns the buffer(s)
+			 * and drains the frag chain from pool->xskb_list.
+			 * DROP: ena_xdp_return_buff() already freed them.
+			 * Either way just drop our references so teardown/refill
+			 * won't double-free.
 			 */
 			if (likely(xdp_verdict & (ENA_XDP_FORWARDED | ENA_XDP_DROP))) {
 				rx_info->xdp = NULL;
 #ifdef ENA_XSK_MB_SUPPORT
-				for (i = 1; i < ena_rx_ctx.descs; i++) {
-					struct ena_rx_buffer *frag_info;
-
-					frag_info = &rx_ring->rx_buffer_info[
-						ena_rx_ctx.ena_bufs[i].req_id];
-					frag_info->xdp = NULL;
-				}
+				ena_xdp_zc_unref_frags(rx_ring, &ena_rx_ctx);
+			} else if (xdp_buff_has_frags(xdp)) {
+				/* RECYCLE of an assembled multi-buffer packet:
+				 * the head still carries XDP_FLAGS_HAS_FRAGS and
+				 * the frags are still linked in pool->xskb_list,
+				 * so reusing the buffers in place would leak that
+				 * stale state into the next packet. Free the whole
+				 * chain (this drains xskb_list) and drop our
+				 * references so refill reallocates clean buffers.
+				 */
+				xsk_buff_free(xdp);
+				rx_info->xdp = NULL;
+				ena_xdp_zc_unref_frags(rx_ring, &ena_rx_ctx);
 #endif /* ENA_XSK_MB_SUPPORT */
 			}
 
@@ -1106,6 +1331,20 @@ consume_descs:
 			rc = -ENOMEM;
 			break;
 		}
+
+#ifdef ENA_XSK_MB_SUPPORT
+		/* For an assembled multi-buffer packet the payload has now been
+		 * copied into the linear skb. Free the chain (drains
+		 * pool->xskb_list and clears the head's HAS_FRAGS state) and
+		 * drop our references so refill reallocates clean buffers
+		 * instead of reusing stale frag state.
+		 */
+		if (xdp_buff_has_frags(xdp)) {
+			xsk_buff_free(xdp);
+			rx_info->xdp = NULL;
+			ena_xdp_zc_unref_frags(rx_ring, &ena_rx_ctx);
+		}
+#endif /* ENA_XSK_MB_SUPPORT */
 
 		pkt_copy++;
 		work_done++;
