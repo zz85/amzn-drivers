@@ -1346,6 +1346,21 @@ consume_descs:
 		/* XDP PASS */
 		skb = ena_xdp_rx_skb_zc(rx_ring, xdp);
 		if (unlikely(!skb)) {
+#ifdef ENA_XSK_MB_SUPPORT
+			/* skb alloc failed: the descriptors were already queued
+			 * for refill by the consume loop above. For an assembled
+			 * multi-buffer packet we must still free the chain and
+			 * drop our references here, otherwise refill reuses the
+			 * head with XDP_FLAGS_HAS_FRAGS set and the frags still
+			 * linked in pool->xskb_list, leading to a later
+			 * double-free/UAF. Mirror the success-path cleanup below.
+			 */
+			if (xdp_buff_has_frags(xdp)) {
+				xsk_buff_free(xdp);
+				rx_info->xdp = NULL;
+				ena_xdp_zc_unref_frags(rx_ring, &ena_rx_ctx);
+			}
+#endif /* ENA_XSK_MB_SUPPORT */
 			rc = -ENOMEM;
 			break;
 		}
