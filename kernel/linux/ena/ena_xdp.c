@@ -1102,7 +1102,7 @@ static bool ena_xdp_xmit_irq_zc(struct ena_ring *tx_ring,
 
 static struct sk_buff *ena_xdp_rx_skb_zc(struct ena_ring *rx_ring, struct xdp_buff *xdp)
 {
-	u32 headroom, data_len;
+	u32 headroom, data_len, total_len;
 	struct sk_buff *skb;
 	void *data_addr;
 
@@ -1110,9 +1110,22 @@ static struct sk_buff *ena_xdp_rx_skb_zc(struct ena_ring *rx_ring, struct xdp_bu
 	data_len  = xdp->data_end - xdp->data;
 	data_addr = xdp->data;
 
+	/* The skb must hold the whole reassembled packet: the linear head plus
+	 * every fragment. Sizing it for the first descriptor only and then
+	 * __skb_put()'ing each frag (the unchecked put, no tailroom check)
+	 * overruns the linear area and corrupts the adjacent skb_shared_info,
+	 * which later panics in skb_release_data() when the frag array is
+	 * walked.
+	 */
+	total_len = data_len;
+#ifdef ENA_XSK_MB_SUPPORT
+	if (xdp_buff_has_frags(xdp))
+		total_len += xdp_get_shared_info_from_buff(xdp)->xdp_frags_size;
+#endif /* ENA_XSK_MB_SUPPORT */
+
 	/* allocate a skb to store the data */
 	skb = napi_alloc_skb(rx_ring->napi,
-			     headroom + data_len);
+			     headroom + total_len);
 	if (unlikely(!skb)) {
 		ena_increase_stat(&rx_ring->rx_stats.skb_alloc_fail, 1,
 				  &rx_ring->syncp);
@@ -1125,7 +1138,12 @@ static struct sk_buff *ena_xdp_rx_skb_zc(struct ena_ring *rx_ring, struct xdp_bu
 	memcpy(__skb_put(skb, data_len), data_addr, data_len);
 
 #ifdef ENA_XSK_MB_SUPPORT
-	/* Copy frag data for multi-buffer packets (XDP_PASS path) */
+	/* Copy frag data for multi-buffer packets (XDP_PASS path). The skb was
+	 * sized for headroom + data_len + xdp_frags_size above, so these puts
+	 * stay within the linear area. The bytes are copied out of the XSK
+	 * (net_iov-backed) buffers; the resulting skb is fully linear and never
+	 * references XSK memory as page frags.
+	 */
 	if (xdp_buff_has_frags(xdp)) {
 		struct skb_shared_info *sinfo = xdp_get_shared_info_from_buff(xdp);
 		int i;
